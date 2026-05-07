@@ -398,7 +398,11 @@ class VLA(PreTrainedModel):
             state_dict = {k.replace(".base_layer.", "."): v for k, v in state_dict.items()}
 
         # Load weights
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        missing_keys, unexpected_keys = model.load_state_dict(
+            state_dict,
+            strict=False,
+            assign=True,
+        )
             
         if missing_keys:
             print(f"Missing keys when loading pretrained weights: {missing_keys}")
@@ -501,8 +505,6 @@ class VLA(PreTrainedModel):
         pretrained_model_name_or_path: str,
         config: VLAConfig = None
     ):
-        del config
-
         from safetensors.torch import load_file
         import os
         import json
@@ -531,12 +533,17 @@ class VLA(PreTrainedModel):
             print(f"Loading weights from safetensors: {safetensors_path}")
             state_dict.update(load_file(safetensors_path))
         
-        # Load config
+        # Load config. Respect an explicitly provided config so callers can
+        # override nested pretrained component paths without editing the
+        # checkpoint's on-disk config.json.
         print("loading config@@")
-        config_path = os.path.join(pretrained_model_name_or_path, "config.json")
-        with open(config_path, "r") as f:
-            config_dict = json.load(f)
-        config = VLAConfig(**config_dict)
+        if config is None:
+            config_path = os.path.join(pretrained_model_name_or_path, "config.json")
+            with open(config_path, "r") as f:
+                config_dict = json.load(f)
+            config = VLAConfig(**config_dict)
+        elif isinstance(config, dict):
+            config = VLAConfig(**config)
         print("loading model")
         print("config.action_head_cfg", config.action_head_cfg)
         # Always disable defer_lora_injection
@@ -562,7 +569,11 @@ class VLA(PreTrainedModel):
                 new_state_dict[new_k] = v
             state_dict = new_state_dict
 
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        missing_keys, unexpected_keys = model.load_state_dict(
+            state_dict,
+            strict=False,
+            assign=True,
+        )
             
         if missing_keys:
             print(f"Missing keys when loading pretrained weights: {missing_keys}")

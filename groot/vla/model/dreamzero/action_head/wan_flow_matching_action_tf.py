@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 WAN_HF_REPO_ID = "Wan-AI/Wan2.1-I2V-14B-480P"
 WAN22_HF_REPO_ID = "Wan-AI/Wan2.2-TI2V-5B"
+DISABLE_TORCH_COMPILE = os.getenv("DISABLE_TORCH_COMPILE", "False").lower() == "true"
 
 
 def hf_download(filename: str, repo_id: str = WAN_HF_REPO_ID) -> str:
@@ -48,6 +49,7 @@ from groot.vla.model.dreamzero.modules.flow_match_scheduler import FlowMatchSche
 from groot.vla.model.dreamzero.modules.vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 from groot.vla.model.dreamzero.modules.wan_video_text_encoder import T5RelativeEmbedding, T5LayerNorm
 from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import FlowUniPCMultistepScheduler
+from groot.vla.model.dreamzero.modules.utils import init_weights_on_device
 
 
 KVCacheType: TypeAlias = torch.Tensor
@@ -171,9 +173,13 @@ class WANPolicyHead(ActionHead):
         self.num_frame_per_block = config.num_frame_per_block
         self.hidden_size = config.hidden_size
         self.num_frames = config.num_frames
-        self.text_encoder = instantiate(config.text_encoder_cfg)
-        self.image_encoder = instantiate(config.image_encoder_cfg)
-        self.vae = instantiate(config.vae_cfg)
+        # These components are always immediately overwritten by pretrained
+        # checkpoints, so construct them on meta to avoid expensive redundant
+        # parameter initialization on CPU/GPU first.
+        with init_weights_on_device(device=torch.device("meta"), include_buffers=True):
+            self.text_encoder = instantiate(config.text_encoder_cfg)
+            self.image_encoder = instantiate(config.image_encoder_cfg)
+            self.vae = instantiate(config.vae_cfg)
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.model_names = ['text_encoder']
 
@@ -234,7 +240,8 @@ class WANPolicyHead(ActionHead):
 
         self.cpu_offload = False
 
-        self.model = instantiate(config.diffusion_model_cfg)
+        with init_weights_on_device(device=torch.device("meta"), include_buffers=True):
+            self.model = instantiate(config.diffusion_model_cfg)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -243,13 +250,20 @@ class WANPolicyHead(ActionHead):
             self.text_encoder.text_encoder_pretrained_path,
             "models_t5_umt5-xxl-enc-bf16.pth",
         )
-        self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
+        self.text_encoder.load_state_dict(
+            torch.load(text_enc_path, map_location='cpu'),
+            assign=True,
+        )
 
         img_enc_path = ensure_file(
             self.image_encoder.image_encoder_pretrained_path,
             "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
         )
-        self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
+        self.image_encoder.model.load_state_dict(
+            torch.load(img_enc_path, map_location='cpu'),
+            strict=False,
+            assign=True,
+        )
 
         # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
         vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
@@ -259,7 +273,10 @@ class WANPolicyHead(ActionHead):
             vae_hf_filename,
             repo_id=vae_repo_id,
         )
-        self.vae.model.load_state_dict(torch.load(vae_path, map_location='cpu'))
+        self.vae.model.load_state_dict(
+            torch.load(vae_path, map_location='cpu'),
+            assign=True,
+        )
 
         if not config.skip_component_loading:
             dit_dir = self.model.diffusion_model_pretrained_path
@@ -300,7 +317,11 @@ class WANPolicyHead(ActionHead):
                 else:
                     raise ValueError(f"No safetensors file found at {safetensors_path} or {safetensors_index_path}")
 
-                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+                missing_keys, unexpected_keys = self.model.load_state_dict(
+                    state_dict,
+                    strict=False,
+                    assign=True,
+                )
 
                 if missing_keys:
                     print(f"Missing keys when loading pretrained weights: {missing_keys}")
@@ -1361,7 +1382,7 @@ class WANPolicyHead(ActionHead):
 
         # Torch compile the modules. Skip _forward_blocks: Dynamo with fullgraph can fail on
         # shape variation (e.g. x [1,50,C] vs e [1,200,C]); the block aligns e to x at runtime.
-        if not ENABLE_TENSORRT:
+        if not ENABLE_TENSORRT and not DISABLE_TORCH_COMPILE:
             print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
 
             self.text_encoder.forward = torch.compile(
@@ -1375,6 +1396,8 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
+        else:
+            print("Skipping torch.compile for TextEncoder, ImageEncoder, VAE, and scheduler helpers.")
         
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
